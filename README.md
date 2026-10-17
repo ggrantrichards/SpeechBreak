@@ -1,3 +1,34 @@
+# SpeechBreak — Glenn's Research Fork
+
+My working fork of [VladPavlovich/SpeechBreak](https://github.com/VladPavlovich/SpeechBreak).
+
+## My work
+
+The [`glenn/dataset-audit` branch](https://github.com/ggrantrichards/SpeechBreak/tree/glenn/dataset-audit) contains dataset annotation and audit tooling, including:
+
+- Prompt metadata for language, topic, and task type.
+- Dataset and split summaries, duplicate checks, and audio-manifest statistics.
+- Automatic labels with a review queue for uncertain cases.
+- A [dataset audit report](https://github.com/ggrantrichards/SpeechBreak/blob/glenn/dataset-audit/docs/dataset_audit.md) documenting methodology and limitations.
+
+Automatic annotations are not human-verified labels. The audit report explains how to interpret the counts and review status.
+
+## Navigate this fork
+
+The default branch retains the inherited RepIt implementation and documentation below. For my SpeechBreak dataset work, check out the branch explicitly:
+
+```bash
+git clone https://github.com/ggrantrichards/SpeechBreak.git
+cd SpeechBreak
+git switch glenn/dataset-audit
+```
+
+## Inherited RepIt documentation
+
+The following documentation describes the underlying RepIt project; its results and authorship belong to that work.
+
+---
+
 # RepIt: Steering Language Models with Concept-Specific Refusal Vectors
 
 This repository contains the implementation of RepIt (Representing Isolated Targets), a framework for isolating concept-specific representations in language model activations to enable precise behavioral interventions. This work demonstrates how to selectively suppress refusal on targeted concepts while preserving refusal behavior elsewhere.
