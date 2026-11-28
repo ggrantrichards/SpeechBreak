@@ -29,6 +29,12 @@ alpha is in raw direction units: alpha = 1 moves an average harmless activation 
 harmful one. Positive alpha adds the direction (more refusal), negative alpha subtracts it (jailbreak).
 
 Usage:  bash scripts/run_steps.sh          or   python -m steering.run_steps --step sweep
+
+Other models (same six steps, results in their own folder, same frozen split):
+  --model qwen3-omni --input audio   Qwen3-Omni-30B-A3B, spoken requests  -> results_qwen3omni/
+  --model qwen3-omni --input text    Qwen3-Omni-30B-A3B, written requests -> results_qwen3omni_text/
+                                     (Thinker only; the direction VoiceBench's Qwen3-Omni agent uses)
+  Qwen3-Omni supports exp1-3 (it has no linear Thinker <-> Talker bridge for exp4a / exp4b).
 """
 
 import argparse
@@ -51,6 +57,51 @@ from steering.qwen_omni import STREAMS, QwenOmni
 
 RESULTS = os.path.join(REPO_ROOT, "results")
 DEMO_PROMPT_FILE = os.path.join(REPO_ROOT, "scripts", "demo_prompt.txt")
+
+# Which model the steps run on; set by configure() from --model / --input / --model_id.
+# Defaults reproduce the original Qwen2.5-Omni behaviour exactly.
+MODEL = {"name": "qwen2.5-omni", "input": "audio", "id": None}
+ACTIVE_STREAMS = list(STREAMS)
+RESULT_DIRS = {("qwen2.5-omni", "audio"): "results",
+               ("qwen3-omni", "audio"): "results_qwen3omni",
+               ("qwen3-omni", "text"): "results_qwen3omni_text"}
+
+
+def configure(name: str, input_mode: str, model_id: Optional[str] = None):
+    global RESULTS, ACTIVE_STREAMS
+    if (name, input_mode) not in RESULT_DIRS:
+        raise SystemExit(f"--model {name} --input {input_mode} is not supported "
+                         f"(supported: {sorted(RESULT_DIRS)})")
+    MODEL.update(name=name, input=input_mode, id=model_id)
+    RESULTS = os.path.join(REPO_ROOT, RESULT_DIRS[(name, input_mode)])
+    # text prompts are read at the last prompt token, which the Talker never sees
+    ACTIVE_STREAMS = ["thinker"] if input_mode == "text" else list(STREAMS)
+
+
+def make_model(need_talker: bool = True):
+    """The configured model. Qwen3-Omni can drop its Talker when a step only uses the Thinker."""
+    if MODEL["name"] == "qwen3-omni":
+        from steering.qwen3_omni import MODEL_ID as Q3_ID, Qwen3Omni
+        return Qwen3Omni(MODEL["id"] or Q3_ID, input_mode=MODEL["input"], load_talker=need_talker)
+    return QwenOmni(MODEL["id"]) if MODEL["id"] else QwenOmni()
+
+
+def supported_experiments() -> List[str]:
+    if MODEL["name"] == "qwen3-omni":
+        from steering.qwen3_omni import Qwen3Omni
+        exps = list(Qwen3Omni.EXPERIMENTS)
+    else:
+        exps = list(EXPERIMENTS)
+    if "talker" not in ACTIVE_STREAMS:
+        exps = [e for e in exps if e == "exp1_thinker"]
+    return exps
+
+
+def item_inputs(model, it: dict) -> Dict[str, torch.Tensor]:
+    """Model inputs for a dataset item (spoken or written, per the model's input mode)."""
+    if hasattr(model, "process_item"):
+        return model.process_item(it, REPO_ROOT)
+    return model.process_audio(os.path.join(REPO_ROOT, it["audio_path"]))
 OUTPUT_SR = 24000  # Qwen2.5-Omni speaks at 24 kHz
 ABBR = {"thinker": "th", "talker": "tk"}
 
@@ -131,10 +182,13 @@ def seed_for(key: str) -> int:
     return int(hashlib.md5(key.encode()).hexdigest()[:8], 16)
 
 
-def generate_reply(model: QwenOmni, audio_path: str, hooks, wav_out: str, seed: int) -> dict:
-    """Spoken reply to one wav with steering hooks; saves it to wav_out -> {"text", "duration_s"}."""
+def generate_reply(model: QwenOmni, prompt, hooks, wav_out: str, seed: int) -> dict:
+    """
+    Spoken reply with steering hooks; saves it to wav_out -> {"text", "duration_s"}. prompt is a
+    wav path, or the model inputs already built (item_inputs).
+    """
     torch.manual_seed(seed)
-    inputs = model.process_audio(audio_path)
+    inputs = model.process_audio(prompt) if isinstance(prompt, str) else prompt
     with torch.inference_mode(), add_hooks(module_forward_pre_hooks=hooks, module_forward_hooks=[]):
         out = model.generate(inputs)
     audio = out["audio"]
@@ -160,7 +214,7 @@ def speak(texts: List[str], wavs: List[str], voice: str):
 
 def step_extract(splits):
     model = None
-    for stream in STREAMS:
+    for stream in ACTIVE_STREAMS:
         for split in ("train", "val"):
             out = path("1_activations", f"{stream}_{split}.pt")
             have = torch.load(out) if os.path.exists(out) else {"acts": {}, "ids": {}}
@@ -169,9 +223,12 @@ def step_extract(splits):
                 ids = [item_id(it) for it in items]
                 if have["ids"].get(cat) == ids:
                     continue
-                model = model or QwenOmni()
+                model = model or make_model(need_talker="talker" in ACTIVE_STREAMS)
                 t0 = time.time()
-                acts = model.extract_activations([os.path.join(REPO_ROOT, it["audio_path"]) for it in items], stream)
+                if hasattr(model, "process_item"):  # takes items: spoken or written per input mode
+                    acts = model.extract_activations(items, stream, REPO_ROOT)
+                else:
+                    acts = model.extract_activations([os.path.join(REPO_ROOT, it["audio_path"]) for it in items], stream)
                 have["acts"][cat], have["ids"][cat] = acts.half(), ids
                 print(f"[extract] {stream}/{split}/{cat}: {tuple(acts.shape)} in {time.time() - t0:.0f}s", flush=True)
                 changed = True
@@ -194,7 +251,7 @@ def load_acts(stream: str, split: str) -> Dict[str, torch.Tensor]:
 # ---------------------------------------------------------------------- #
 
 def step_directions():
-    for stream in STREAMS:
+    for stream in ACTIVE_STREAMS:
         train, val = load_acts(stream, "train"), load_acts(stream, "val")
         harm_train = torch.cat([train[c] for c in HARMFUL_CATEGORIES])
         harm_val = torch.cat([val[c] for c in HARMFUL_CATEGORIES])
@@ -229,7 +286,7 @@ def step_directions():
 
 def load_directions() -> Dict[str, torch.Tensor]:
     dirs = {}
-    for stream in STREAMS:
+    for stream in ACTIVE_STREAMS:
         p = path("2_directions", f"direction_{stream}.pt")
         if not os.path.exists(p):
             raise SystemExit(f"no directions at {rel(p)}; run step 2 (directions) first")
@@ -252,11 +309,11 @@ def phrase_batch(inputs: Dict[str, torch.Tensor], phrase_ids: List[List[int]], p
         ids[i, :plen] = prompt
         ids[i, plen:plen + len(p)] = torch.tensor(p, dtype=prompt.dtype, device=prompt.device)
         mask[i, :plen + len(p)] = 1
-    return {
-        "input_ids": ids, "attention_mask": mask,
-        "input_features": inputs["input_features"].repeat(n, 1, 1),
-        "feature_attention_mask": inputs["feature_attention_mask"].repeat(n, 1),
-    }
+    batch = {"input_ids": ids, "attention_mask": mask}
+    if "input_features" in inputs:  # spoken prompts (written ones have no audio features)
+        batch["input_features"] = inputs["input_features"].repeat(n, 1, 1)
+        batch["feature_attention_mask"] = inputs["feature_attention_mask"].repeat(n, 1)
+    return batch
 
 
 @torch.inference_mode()
@@ -285,6 +342,8 @@ def talker_first_logprobs(model: QwenOmni, inputs, hooks) -> torch.Tensor:
     Talker needs >= 2), the Talker runs its prefill, and generation stops at the codec head, so no
     audio is produced. Talker hooks don't touch the Thinker, so its 2 tokens match across runs.
     """
+    if hasattr(model, "talker_first_logprobs"):  # models whose generate() API differs (Qwen3-Omni)
+        return model.talker_first_logprobs(inputs, hooks)
     store = {}
 
     def capture(module, args, output):
@@ -301,9 +360,10 @@ def talker_first_logprobs(model: QwenOmni, inputs, hooks) -> torch.Tensor:
 
 
 def step_sweep(splits, n_sweep: int, alpha: float, top_k: int, rank_by: str, min_sep_d: float, streams: List[str]):
+    streams = [s for s in streams if s in ACTIVE_STREAMS]
     dirs = load_directions()
     groups = held_out_items(splits, n_sweep)
-    model = QwenOmni()
+    model = make_model(need_talker="talker" in streams)
     tok = model.processor.tokenizer
     phrase_ids = [tok(p, add_special_tokens=False).input_ids for p in RESIST_PHRASES + COMPLY_PHRASES]
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
@@ -315,7 +375,7 @@ def step_sweep(splits, n_sweep: int, alpha: float, top_k: int, rank_by: str, min
         progress = Progress(f"sweep {stream}", total)
         for group, items in groups.items():
             for it in items:
-                inputs = model.process_audio(os.path.join(REPO_ROOT, it["audio_path"]))
+                inputs = item_inputs(model, it)
                 if stream == "thinker":
                     plen = inputs["input_ids"].shape[1]
                     batch = phrase_batch(inputs, phrase_ids, pad_id)
@@ -423,7 +483,10 @@ def top_layers(stream: str) -> List[int]:
 # dir_stream direction from dir_layer (mapped across streams if needed) to hook_stream's block `layer`.
 
 def experiment_specs(exp: str) -> List[List[list]]:
-    th, tk = top_layers("thinker"), top_layers("talker")
+    th = top_layers("thinker")
+    if exp == "exp1_thinker":
+        return [[["thinker", l, "thinker", l]] for l in th]
+    tk = top_layers("talker")
     if exp == "exp1_thinker":
         return [[["thinker", l, "thinker", l]] for l in th]
     if exp == "exp2_talker":
@@ -497,6 +560,11 @@ def step_generate(splits, alphas: List[float], n_gen: int, n_sweep: int, experim
     starts num_shards workers side by side (under MPS), each taking every num_shards-th job.
     """
     dirs = load_directions()
+    supported = supported_experiments()
+    if [e for e in experiments if e not in supported]:
+        print(f"[generate] {MODEL['name']} ({MODEL['input']} input) supports {supported}; "
+              f"skipping {[e for e in experiments if e not in supported]}", flush=True)
+    experiments = [e for e in experiments if e in supported]
     # Generation prompts come after the sweep's prompts in the val split, so they didn't pick the layers
     items = held_out_items(splits, n_gen, offset=n_sweep)
 
@@ -517,13 +585,13 @@ def step_generate(splits, alphas: List[float], n_gen: int, n_sweep: int, experim
         return
 
     rec_path = path("4_generations", "records.jsonl" if num_shards == 1 else f"records.shard{shard}.jsonl")
-    model = QwenOmni()
+    model = make_model()
     progress = Progress("generate", len(todo))
     with open(rec_path, "a") as f:
         for key, it, exp, spec, alpha, group in todo:
             hooks = [] if spec is None else steering_hooks(model, dirs, spec, alpha)
             wav = os.path.join("wav", key.replace("|", "__").replace("<", "from") + ".wav")
-            out = generate_reply(model, os.path.join(REPO_ROOT, it["audio_path"]), hooks,
+            out = generate_reply(model, item_inputs(model, it), hooks,
                                  path("4_generations", wav), seed_for(item_id(it)))
             f.write(json.dumps({"key": key, "item_id": item_id(it), "category": it["category"],
                                 "input": it["spoken_text"], "wav": wav, "exp": exp, "spec": spec,
@@ -692,19 +760,24 @@ def step_demo(exp: str, mode: str, layer: Optional[int], alpha: Optional[float],
     spec, alpha, why = choose_demo_setting(exp, mode, layer, alpha)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     in_wav, out_wav = path("6_demo", f"{stamp}_input.wav"), path("6_demo", f"{stamp}_output.wav")
-    speak([text], [in_wav], voice)
+    if MODEL["input"] == "audio":
+        speak([text], [in_wav], voice)
+    else:
+        in_wav = None  # written prompt: no TTS
 
     print(f"[demo] {exp} {spec_label(spec)}, α = {alpha:+g} ({why})", flush=True)
     dirs = load_directions()
-    model = QwenOmni()
+    model = make_model()
     hooks = steering_hooks(model, dirs, spec, alpha) if alpha else []
-    out = generate_reply(model, in_wav, hooks, out_wav, seed_for(text))
+    prompt = in_wav if in_wav else model.process_text(text)
+    out = generate_reply(model, prompt, hooks, out_wav, seed_for(text))
     model.unload()
 
     from steering import scoring
     asr = scoring.transcribe_and_embed([out_wav])[out_wav]
 
-    result = {"time": stamp, "prompt_text": text, "voice": voice, "input_wav": rel(in_wav),
+    result = {"time": stamp, "prompt_text": text, "voice": voice if in_wav else None,
+              "input_wav": rel(in_wav) if in_wav else None, "model": MODEL["name"], "input": MODEL["input"],
               "experiment": exp, "mode": mode, "layers": spec_label(spec), "spec": spec,
               "alpha": alpha, "setting": why, "thinker_text": out["text"], "output_wav": rel(out_wav),
               "output_asr": asr["asr"], "duration_s": out["duration_s"], "voiced_s": asr["voiced_s"]}
@@ -723,6 +796,11 @@ STEPS = ["extract", "directions", "sweep", "generate", "evaluate", "demo"]
 def parse_args():
     p = argparse.ArgumentParser(description="Steer Qwen2.5-Omni with a harmful-vs-harmless direction (6 steps)")
     p.add_argument("--step", required=True, choices=STEPS)
+    p.add_argument("--model", default="qwen2.5-omni", choices=["qwen2.5-omni", "qwen3-omni"],
+                   help="which model (results in results/, results_qwen3omni/ or results_qwen3omni_text/)")
+    p.add_argument("--input", default="audio", choices=["audio", "text"],
+                   help="spoken requests (default) or their text; text is Thinker-only and qwen3-omni-only")
+    p.add_argument("--model_id", default=None, help="override the HF id / local path of the model")
     p.add_argument("--streams", nargs="+", default=list(STREAMS), choices=STREAMS, help="sweep: streams to sweep")
     p.add_argument("--n_sweep", type=int, default=8, help="sweep: val prompts per group (harmless / harmful)")
     p.add_argument("--sweep_alpha", type=float, default=1.0, help="sweep: direction multiple added (1 = raw)")
@@ -746,6 +824,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    configure(args.model, args.input, args.model_id)
     splits = load_splits()
     if args.step == "extract":
         step_extract(splits)

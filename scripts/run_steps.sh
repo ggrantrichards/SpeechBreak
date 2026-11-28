@@ -34,7 +34,12 @@ export PYTHONWARNINGS=ignore PYTHONUNBUFFERED=1
 log() { echo "[$(date '+%m-%d %H:%M:%S')] $*"; }
 
 # ---------------------------------------------------------------------------- GPU workers
-WORKER_MIB=${WORKER_MIB:-25600}   # Qwen2.5-Omni measured peak + context + margin
+MODEL=${MODEL:-qwen2.5-omni}       # or qwen3-omni (Qwen3-Omni-30B-A3B, needs a whole 80 GB GPU)
+INPUT=${INPUT:-audio}              # qwen3-omni only: text = written requests, Thinker only
+MODEL_ARGS=(--model "$MODEL" --input "$INPUT")
+[ -n "${MODEL_ID:-}" ] && MODEL_ARGS+=(--model_id "$MODEL_ID")
+if [ "$MODEL" = qwen3-omni ]; then DEFAULT_MIB=78000; else DEFAULT_MIB=25600; fi
+WORKER_MIB=${WORKER_MIB:-$DEFAULT_MIB}   # per-worker GPU memory (Qwen2.5-Omni peak + margin; Qwen3-Omni = 1 worker)
 MAX_WORKERS=${MAX_WORKERS:-8}
 
 n_workers() {
@@ -82,7 +87,7 @@ run_workers() {  # run_workers <args...>: parallel shards (MPS), lines prefixed 
     [ "$n" -gt 1 ] && start_mps
     local pids=() i rc=0
     for ((i = 0; i < n; i++)); do
-        python -m steering.run_steps "$@" --shard "$i" --num_shards "$n" \
+        python -m steering.run_steps "${MODEL_ARGS[@]}" "$@" --shard "$i" --num_shards "$n" \
             > >(sed -u "s/^/    [w$i] /") 2>&1 &
         pids+=($!)
         sleep 20  # stagger model loading so memory peaks don't coincide
@@ -101,7 +106,7 @@ TOP_K=${TOP_K:-3}
 RANK_BY=${RANK_BY:-kl}
 ALPHAS=${ALPHAS:-"0.5 1 2"}
 N_GEN=${N_GEN:-5}
-EXPS=${EXPS:-"exp1_thinker exp2_talker exp3_both exp4a_thinker_to_talker exp4b_talker_to_thinker"}
+EXPS=${EXPS:-"exp1_thinker exp2_talker exp3_both exp4a_thinker_to_talker exp4b_talker_to_thinker"}  # unsupported ones are skipped per model
 DEMO_EXP=${DEMO_EXP:-exp1_thinker}
 DEMO_MODE=${DEMO_MODE:-induce}
 
@@ -112,7 +117,7 @@ DEMO_ARGS=(--demo_exp "$DEMO_EXP" --demo_mode "$DEMO_MODE")
 
 # ---------------------------------------------------------------------------- steps
 T_START=$(date +%s)
-log "=== Qwen2.5-Omni steering | steps: $STEPS ==="
+log "=== $MODEL ($INPUT input) steering | steps: $STEPS ==="
 status=0
 for step in $STEPS; do
     case "$step" in
@@ -126,7 +131,7 @@ for step in $STEPS; do
         run_workers --step generate --n_sweep "$N_SWEEP" "${extra[@]}" || { log "!!! generate failed"; status=1; break; }
         continue
     fi
-    python -m steering.run_steps --step "$step" --n_sweep "$N_SWEEP" "${extra[@]}" 2>&1 | sed -u "s/^/    /"
+    python -m steering.run_steps "${MODEL_ARGS[@]}" --step "$step" --n_sweep "$N_SWEEP" "${extra[@]}" 2>&1 | sed -u "s/^/    /"
     [ "${PIPESTATUS[0]}" -eq 0 ] || { log "!!! $step failed"; status=1; break; }
 done
 

@@ -13,3 +13,6 @@ dataset/audio/
 results_kimi/1_activations/
 results_kimi/4_generations/wav/
 results_kimi/steer_prompts/
+# Qwen3-Omni: same rule
+results_qwen3omni*/1_activations/
+results_qwen3omni*/4_generations/wav/
